@@ -510,6 +510,55 @@ end
     @test issorted(Pcr; rev = true)
 end
 
+@testset "ThinWalledBeamColumn-style interface" begin
+    z = collect(range(0, 2L, 81))
+    n = length(z); o = ones(n)
+    s, r = sec1, Restraint(kx = 0.02, kϕ = 0.05, hy = -46.05)
+    Pz = 8e3 .* (1 .- z ./ 2L)
+    supports = [(0.0, "fixed", "fixed", "free"), (L, "fixed", "free", "fixed"), (2L, "fixed", "fixed", "free")]
+    ends = ["simply-supported", "free"]
+    m = PBC.solve(z, s.A * o, s.Ix * o, s.Iy * o, s.Io * o, s.J * o, s.Cw * o, mat.E * o, mat.G * o,
+                  20.65 * o, 46.05 * o, r.kx * o, r.ky * o, r.kϕ * o, r.hx * o, r.hy * o,
+                  0.01 * o, 0.05 * o, Pz, ends, supports; xo = s.xo * o, yo = s.yo * o)
+    @test m isa Model
+    # same as building the model directly
+    sec = Section(A = s.A, Ix = s.Ix, Iy = s.Iy, Io = s.Io, J = s.J, Cw = s.Cw, xo = s.xo, yo = s.yo, ax = 20.65, ay = 46.05)
+    direct = BeamColumnModel(z = z, section = sec, material = mat, restraint = r, qx = 0.01, qy = 0.05, P = Pz,
+                             bc_left = :free, bc_right = :free,
+                             supports = [Support(0.0; ϕ = false), Support(L; v = false), Support(2L; ϕ = false)])
+    sd = solve_beam_column(direct)
+    @test m.outputs.u ≈ sd.d[1:6:end]
+    @test m.outputs.v ≈ sd.d[3:6:end]
+    @test m.outputs.ϕ ≈ sd.d[5:6:end]
+    # supports honoured: (0, fixed, fixed, free), (L, fixed, free, fixed)
+    @test m.outputs.u[1] == 0.0 == m.outputs.v[1] && m.outputs.ϕ[1] != 0.0
+    @test m.outputs.u[41] == 0.0 == m.outputs.ϕ[41] && m.outputs.v[41] != 0.0
+    @test m.inputs.z == z && m.inputs.P == Pz && m.inputs.supports == supports
+    @test m.solution.stable
+    # "fixed" ends with all-fixed supports ≡ :fixed end conditions
+    z1 = collect(range(0, L, 41)); o1 = ones(41)
+    mf = PBC.solve(z1, s.A * o1, s.Ix * o1, s.Iy * o1, s.Io * o1, s.J * o1, s.Cw * o1, mat.E * o1, mat.G * o1,
+                   z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, 0.02 * o1, z1 .* 0, 5e3 * o1, ["fixed", "fixed"],
+                   [(0.0, "fixed", "fixed", "fixed"), (L, "fixed", "fixed", "fixed")]; xo = s.xo * o1)
+    sf = solve_beam_column(BeamColumnModel(z = z1, section = Section(A = s.A, Ix = s.Ix, Iy = s.Iy, Io = s.Io, J = s.J, Cw = s.Cw, xo = s.xo),
+                                           material = mat, qx = 0.02, P = 5e3, bc_left = :fixed, bc_right = :fixed))
+    @test mf.outputs.u ≈ sf.d[1:6:end]
+    @test mf.outputs.u[21] ≈ 0.02 * L^4 / (384 * mat.E * s.Iy) rtol = 0.2     # P/Pcr small: near first order
+    # with xo = yo = 0 the ThinWalledBeamColumn equations are recovered: no v-ϕ coupling from P
+    m0 = PBC.solve(z1, s.A * o1, s.Ix * o1, s.Iy * o1, s.Io * o1, s.J * o1, s.Cw * o1, mat.E * o1, mat.G * o1,
+                   z1 .* 0, 46.05 * o1, z1 .* 0, z1 .* 0, 0.05 * o1, z1 .* 0, z1 .* 0, z1 .* 0, 0.05 * o1, 15e3 * o1,
+                   ["simply-supported", "simply-supported"], [(0.0, "fixed", "fixed", "fixed"), (L, "fixed", "fixed", "fixed")])
+    @test maximum(abs, m0.outputs.ϕ) < 1e-12
+    mx = PBC.solve(z1, s.A * o1, s.Ix * o1, s.Iy * o1, s.Io * o1, s.J * o1, s.Cw * o1, mat.E * o1, mat.G * o1,
+                   z1 .* 0, 46.05 * o1, z1 .* 0, z1 .* 0, 0.05 * o1, z1 .* 0, z1 .* 0, z1 .* 0, 0.05 * o1, 15e3 * o1,
+                   ["simply-supported", "simply-supported"], [(0.0, "fixed", "fixed", "fixed"), (L, "fixed", "fixed", "fixed")]; xo = s.xo * o1)
+    @test maximum(abs, mx.outputs.ϕ) > 0.01
+    @test_throws ArgumentError PBC.solve(z1, s.A * o1, s.Ix * o1, s.Iy * o1, s.Io * o1, s.J * o1, s.Cw * o1, mat.E * o1, mat.G * o1,
+                   z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, ["pinned", "pinned"], [(0.0, "fixed", "fixed", "fixed")])
+    @test_throws ArgumentError PBC.solve(z1, s.A * o1, s.Ix * o1, s.Iy * o1, s.Io * o1, s.J * o1, s.Cw * o1, mat.E * o1, mat.G * o1,
+                   z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, z1 .* 0, ["free", "free"], [(0.0, "fixed", "pinned", "fixed")])
+end
+
 @testset "stability flag and input validation" begin
     # beyond the critical load the tangent stiffness is indefinite
     sol = @test_logs (:warn, r"not positive definite") solve_beam_column(model2(P = 1.1Pe_y(sec2), imperfection = imp))

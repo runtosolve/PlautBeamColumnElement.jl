@@ -127,6 +127,22 @@ forces[1].end1                     # (z, Vx, My, Vy, Mx, T, B) on the +z face at
 `Vx`, `Vy` include the transverse component of P (reactions come out directly), `My`
 and `Mx` are second-order bending moments, `T` the total torque and `B` the bimoment.
 
+## Drop-in use in place of ThinWalledBeamColumn.jl
+
+`PlautBeamColumnElement.solve` takes the same nodal arrays, end conditions and support
+tuples as `ThinWalledBeamColumn.solve` and returns a `Model` with the same
+`.inputs` / `.outputs.u`, `.outputs.v`, `.outputs.ϕ` fields, plus the finite element
+`model` and `solution`. Pass the shear-center offsets to include the coupling terms:
+
+```julia
+model = PlautBeamColumnElement.solve(z, A, Ix, Iy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy,
+                                     qx, qy, P, ["simply-supported", "simply-supported"],
+                                     [(0.0, "fixed", "fixed", "free"), (L, "fixed", "fixed", "free")];
+                                     xo = xo, yo = yo)
+model.outputs.ϕ          # nodal twist
+model.solution.stable    # false if P exceeds the elastic critical load
+```
+
 ## Relationship to ThinWalledBeamColumn.jl
 
 The same equations and sign conventions (`ax`, `ay`, `qx`, `qy`, `P`, `kx`, `ky`,

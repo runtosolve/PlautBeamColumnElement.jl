@@ -58,7 +58,7 @@ discrete kx, ky in N/mm and kϕ in N·mm/rad.
 module PlautBeamColumnElement
 
 using LinearAlgebra
-using NonlinearSolve
+using NonlinearSolve: NonlinearSolve, NonlinearProblem, NewtonRaphson, SciMLBase
 
 export Section, Material, Restraint, Brace, Support, Imperfection
 export BeamColumnModel, BeamColumnSolution
@@ -67,6 +67,7 @@ export nodes, elastic_stiffness, geometric_stiffness, axial_geometric_stiffness,
 export solve_beam_column, deflections, twist, lateral_deflection, vertical_deflection,
        initial_deflections, total_deflections
 export element_end_forces, brace_forces, critical_load_factors
+export Inputs, Outputs, Model
 
 # ------------------------------------------------------------------
 # Input types
@@ -701,7 +702,7 @@ function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, abstol = 
     residual(d, p) = (p.K * d - p.F) ./ p.s
     p = (K = Kf, F = Ff, s = scale)
     prob = NonlinearProblem(residual, zeros(length(free)), p)
-    sol = solve(prob, NewtonRaphson(); abstol = abstol)
+    sol = NonlinearSolve.solve(prob, NewtonRaphson(); abstol = abstol)
     SciMLBase.successful_retcode(sol) ||
         error("NonlinearSolve did not converge (retcode $(sol.retcode)); " *
               "the load may be at or beyond the critical (singular-stiffness) level")
@@ -878,6 +879,138 @@ function critical_load_factors(m::BeamColumnModel; nmodes::Int = 1, load_stiffne
         d
     end
     return (factors = factors, modes = modes)
+end
+
+# ------------------------------------------------------------------
+# ThinWalledBeamColumn.jl-compatible interface
+# ------------------------------------------------------------------
+
+"""
+    Inputs
+
+Nodal input arrays of the ThinWalledBeamColumn.jl-style interface, see [`solve`](@ref).
+"""
+struct Inputs
+    z::Vector{Float64}
+    A::Vector{Float64}
+    Ix::Vector{Float64}
+    Iy::Vector{Float64}
+    Ixy::Vector{Float64}
+    Io::Vector{Float64}
+    J::Vector{Float64}
+    Cw::Vector{Float64}
+    E::Vector{Float64}
+    G::Vector{Float64}
+    ax::Vector{Float64}
+    ay::Vector{Float64}
+    kx::Vector{Float64}
+    ky::Vector{Float64}
+    kϕ::Vector{Float64}
+    hx::Vector{Float64}
+    hy::Vector{Float64}
+    xo::Vector{Float64}
+    yo::Vector{Float64}
+    qx::Vector{Float64}
+    qy::Vector{Float64}
+    P::Vector{Float64}
+    end_boundary_conditions::Vector{String}
+    supports::Vector{Tuple{Float64, String, String, String}}
+end
+
+"Nodal deformations `u`, `v`, `ϕ` (additional to any imperfection)."
+struct Outputs
+    u::Vector{Float64}
+    v::Vector{Float64}
+    ϕ::Vector{Float64}
+end
+
+"""
+    Model
+
+Result of the ThinWalledBeamColumn.jl-style [`solve`](@ref): `inputs`, `outputs` (nodal
+`u`, `v`, `ϕ`), and the underlying finite element `model::BeamColumnModel` and
+`solution::BeamColumnSolution`.
+"""
+struct Model
+    inputs::Inputs
+    outputs::Outputs
+    model::BeamColumnModel
+    solution::BeamColumnSolution
+end
+
+"""
+    solve(z, A, Ix, Iy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy, qx, qy, P,
+          end_boundary_conditions, supports; xo=0, yo=0, Ixy=0, imperfection=Imperfection(), warn=false)
+
+Drop-in replacement for `ThinWalledBeamColumn.solve`. All property, restraint and load
+arguments are arrays of nodal values at the coordinates `z` (element properties are
+the average of the two end values; loads and P vary linearly inside each element).
+
+  * `end_boundary_conditions = [left, right]` with `"simply-supported"` (u'' = v'' = ϕ'' = 0,
+    a natural condition of the finite element), `"fixed"` (u' = v' = ϕ' = 0 imposed at the
+    end node) or `"free"` (cantilever tip).
+  * `supports = [(z, u, v, ϕ), ...]` with `"fixed"` or `"free"` for each of u, v, ϕ; a
+    support may be placed at any node, including the ends.
+  * `xo`, `yo` — shear center offsets from the centroid (y downward), which add the axial
+    load coupling of Plaut & Moen (2020) Eqs. (1)-(3) that ThinWalledBeamColumn.jl omits.
+    With the defaults `xo = yo = 0` the two packages solve the same equations.
+  * `hx`, `hy` locate the springs from the centroid (ThinWalledBeamColumn.jl effectively
+    measured them from the shear center; identical when `xo = yo = 0`).
+  * `Ixy` — optional product of inertia coupling the two bending equations.
+
+Returns a [`Model`](@ref) whose `outputs.u`, `outputs.v`, `outputs.ϕ` are the nodal
+deformations, as in ThinWalledBeamColumn.jl.
+"""
+function solve(z, A, Ix, Iy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy, qx, qy, P,
+               end_boundary_conditions, supports;
+               xo = zeros(length(z)), yo = zeros(length(z)), Ixy = zeros(length(z)),
+               imperfection::Imperfection = Imperfection(), warn::Bool = false)
+    zz = Float64.(collect(z))
+    n = length(zz)
+    arr(x) = (length(x) == n || throw(ArgumentError("expected $n nodal values, got $(length(x))"));
+              Float64.(collect(x)))
+    A, Ix, Iy, Ixy, Io, J, Cw, E, G = arr.((A, Ix, Iy, Ixy, Io, J, Cw, E, G))
+    ax, ay, kx, ky, kϕ, hx, hy, xo, yo = arr.((ax, ay, kx, ky, kϕ, hx, hy, xo, yo))
+    qx, qy, P = arr.((qx, qy, P))
+    length(end_boundary_conditions) == 2 ||
+        throw(ArgumentError("end_boundary_conditions must have two entries"))
+    for bc in end_boundary_conditions
+        bc in ("simply-supported", "fixed", "free") ||
+            throw(ArgumentError("end boundary condition must be \"simply-supported\", \"fixed\" or \"free\", got \"$bc\""))
+    end
+
+    ne = n - 1
+    mid(x) = [(x[i] + x[i + 1]) / 2 for i in 1:ne]
+    sections = [Section(A = A_, Ix = Ix_, Iy = Iy_, Ixy = Ixy_, Io = Io_, J = J_, Cw = Cw_,
+                        xo = xo_, yo = yo_, ax = ax_, ay = ay_)
+                for (A_, Ix_, Iy_, Ixy_, Io_, J_, Cw_, xo_, yo_, ax_, ay_) in
+                    zip(mid(A), mid(Ix), mid(Iy), mid(Ixy), mid(Io), mid(J), mid(Cw),
+                        mid(xo), mid(yo), mid(ax), mid(ay))]
+    materials = [Material(E = E_, G = G_) for (E_, G_) in zip(mid(E), mid(G))]
+    restraints = [Restraint(kx = kx_, ky = ky_, kϕ = kϕ_, hx = hx_, hy = hy_)
+                  for (kx_, ky_, kϕ_, hx_, hy_) in zip(mid(kx), mid(ky), mid(kϕ), mid(hx), mid(hy))]
+
+    fixed(flag) = flag == "fixed" ? true : flag == "free" ? false :
+                  throw(ArgumentError("support condition must be \"fixed\" or \"free\", got \"$flag\""))
+    fe_supports = [Support(Float64(s[1]); u = fixed(s[2]), v = fixed(s[3]), ϕ = fixed(s[4]))
+                   for s in supports]
+    # "fixed" ends restrain the rotations and warping; translations come from `supports`
+    for (bc, zend) in zip(end_boundary_conditions, (zz[1], zz[end]))
+        bc == "fixed" && push!(fe_supports, Support(zend; u = false, v = false, ϕ = false,
+                                                    u′ = true, v′ = true, ϕ′ = true))
+    end
+
+    model = BeamColumnModel(z = zz, section = sections, material = materials,
+                            restraint = restraints, supports = fe_supports,
+                            imperfection = imperfection, qx = qx, qy = qy, P = P,
+                            bc_left = :free, bc_right = :free)
+    sol = solve_beam_column(model; warn = warn)
+
+    inputs = Inputs(zz, A, Ix, Iy, Ixy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy, xo, yo,
+                    qx, qy, P, String.(collect(end_boundary_conditions)),
+                    [(Float64(s[1]), String(s[2]), String(s[3]), String(s[4])) for s in supports])
+    outputs = Outputs(sol.d[1:6:end], sol.d[3:6:end], sol.d[5:6:end])
+    return Model(inputs, outputs, model, sol)
 end
 
 end # module PlautBeamColumnElement
