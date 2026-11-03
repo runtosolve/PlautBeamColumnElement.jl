@@ -47,6 +47,9 @@ discrete equilibrium is
 
 with Ke the elastic + bracing stiffness and Kg the geometric stiffness from the
 axial force (∫ P N'ᵀN' kernels) and from the load position ((qx ax - qy ay) ϕ).
+Kg depends on the loads (P, q) but not on the displacements d, so for a given load
+state this is a linear system and is solved directly; the response is nonlinear in
+the load magnitude only because Kg scales with the load.
 Discrete braces are added as point springs at nodes. Property and load variation
 along the length is allowed: section, material and continuous restraint per
 element; P, qx, qy at nodes (linear inside each element).
@@ -58,7 +61,6 @@ discrete kx, ky in N/mm and kϕ in N·mm/rad.
 module PlautBeamColumnElement
 
 using LinearAlgebra
-using NonlinearSolve: NonlinearSolve, NonlinearProblem, NewtonRaphson, SciMLBase
 
 export Section, Material, Restraint, Brace, Support, Imperfection
 export BeamColumnModel, BeamColumnSolution
@@ -670,12 +672,15 @@ struct BeamColumnSolution
 end
 
 """
-    solve_beam_column(model; geometric=true, abstol=1e-9, warn=true)
+    solve_beam_column(model; geometric=true, warn=true)
 
-Assemble K = Ke + Kg(P, q) and F = F(q) - Kg d0 and solve the equilibrium residual
-R(d) = K d - F with NonlinearSolve.jl (Newton-Raphson). The residual is
-equilibrated row-by-row by the stiffness diagonal so the convergence tolerance is
-dimensionless. With `geometric=false` the axial-force and load-position
+Assemble K = Ke + Kg(P, q) and F = F(q) - Kg d0 and solve the linear equilibrium
+system K d = F for the free DOFs. Kg depends on the loads but not on the
+displacements, so no iteration is needed. K is factored by Cholesky when it is
+positive definite (stable) and by LU otherwise; an error is thrown if it is
+singular (loads exactly at a critical level, or a mechanism).
+`residual_norm` is the norm of K d - F equilibrated row-by-row by the stiffness
+diagonal (dimensionless). With `geometric=false` the axial-force and load-position
 (geometric) stiffness is dropped, which also removes the imperfection loading, and
 the first-order elastic response is returned.
 
@@ -683,8 +688,7 @@ A warning is issued (unless `warn=false`) when the tangent stiffness is not
 positive definite, i.e. the loads exceed a critical (buckling) level and the
 computed equilibrium state is unstable.
 """
-function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, abstol = 1e-9,
-                           warn::Bool = true)
+function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, warn::Bool = true)
     K = elastic_stiffness(m)
     d0 = imperfection_vector(m)
     F = load_vector(m)
@@ -697,24 +701,25 @@ function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, abstol = 
     free = free_dofs(m)
     Kf = K[free, free]
     Ff = F[free]
-    scale = max.(abs.(diag(Kf)), eps())
 
-    residual(d, p) = (p.K * d - p.F) ./ p.s
-    p = (K = Kf, F = Ff, s = scale)
-    prob = NonlinearProblem(residual, zeros(length(free)), p)
-    sol = NonlinearSolve.solve(prob, NewtonRaphson(); abstol = abstol)
-    SciMLBase.successful_retcode(sol) ||
-        error("NonlinearSolve did not converge (retcode $(sol.retcode)); " *
-              "the load may be at or beyond the critical (singular-stiffness) level")
+    C = cholesky(Symmetric(Kf); check = false)
+    stable = issuccess(C)
+    if !stable
+        C = lu(Kf; check = false)
+        issuccess(C) ||
+            error("stiffness matrix K = Ke + Kg is singular; the loads may be at a " *
+                  "critical level, or the supports do not prevent rigid-body motion")
+    end
+    df = C \ Ff
 
-    stable = isposdef(Symmetric(Kf))
     warn && !stable &&
         @warn "tangent stiffness is not positive definite: the loads exceed a critical " *
               "(buckling) level and the equilibrium state is unstable"
 
+    scale = max.(abs.(diag(Kf)), eps())
     d = zeros(ndofs(m))
-    d[free] = sol.u
-    return BeamColumnSolution(m, d, d0, norm(residual(sol.u, p)), geometric, stable)
+    d[free] = df
+    return BeamColumnSolution(m, d, d0, norm((Kf * df - Ff) ./ scale), geometric, stable)
 end
 
 # ------------------------------------------------------------------

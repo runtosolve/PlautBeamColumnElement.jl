@@ -56,9 +56,9 @@ elements with six DOFs per node (`u, u', v, v', ϕ, ϕ'`). The discrete equilibr
 * **Imperfections**: half-sine amplitudes (paper Eq. 10) or arbitrary functions,
   represented by their Hermite interpolant `d0` and loading the member through
   `-Kg d0`.
-* **Solution**: `R(d) = K d - F` solved with
-  [NonlinearSolve.jl](https://github.com/SciML/NonlinearSolve.jl) (Newton–Raphson,
-  diagonally equilibrated residual). A warning is raised when the tangent stiffness is
+* **Solution**: `Kg` depends on the loads but not on the displacements, so `K d = F`
+  is a linear system for a given load state, solved directly (Cholesky when `K` is
+  positive definite, LU otherwise). A warning is raised when the tangent stiffness is
   indefinite (loads beyond a critical level).
 * **Critical loads** `critical_load_factors(model)`: generalized eigenvalue problem
   `[Ke + Kq] d = λ (-KP) d`, returning load factors on the reference distribution `P`

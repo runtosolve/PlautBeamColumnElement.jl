@@ -1,15 +1,13 @@
 name = "PlautBeamColumnElement"
 uuid = "a45b55a3-f080-4392-acba-796e05a72a03"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Cris Moen <cris.moen@runtosolve.com>"]
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-NonlinearSolve = "8913a72c-1f9b-4ce2-8d82-65094dcecaec"
 
 [compat]
 LinearAlgebra = "1"
-NonlinearSolve = "3, 4"
 julia = "1.10"
 
 [extras]
