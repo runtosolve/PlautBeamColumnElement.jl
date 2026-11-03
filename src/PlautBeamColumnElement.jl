@@ -61,11 +61,13 @@ discrete kx, ky in N/mm and kϕ in N·mm/rad.
 module PlautBeamColumnElement
 
 using LinearAlgebra
+using SparseArrays
 
 export Section, Material, Restraint, Brace, Support, Imperfection
 export BeamColumnModel, BeamColumnSolution
 export nodes, elastic_stiffness, geometric_stiffness, axial_geometric_stiffness,
-       load_geometric_stiffness, load_vector, imperfection_vector, constrained_dofs
+       load_geometric_stiffness, sparse_elastic_stiffness, sparse_geometric_stiffness,
+       load_vector, imperfection_vector, constrained_dofs
 export solve_beam_column, deflections, twist, lateral_deflection, vertical_deflection,
        initial_deflections, total_deflections
 export element_end_forces, brace_forces, critical_load_factors
@@ -573,6 +575,57 @@ load_geometric_stiffness(m::BeamColumnModel) = assemble(m, load_geometric_elemen
 "Total global geometric stiffness Kg = KP + Kq."
 geometric_stiffness(m::BeamColumnModel) = assemble(m, geometric_element_stiffness)
 
+# Sparse assembly: each element couples only its own 12 DOFs and each brace only
+# the (u, v, ϕ) DOFs of one node, so K is banded and sparse storage grows linearly
+# with the number of elements (the dense matrices above grow quadratically).
+
+"Collect the (row, col, value) triplets of the element matrices `element_matrix(m, e)`."
+function element_triplets!(I, J, V, m::BeamColumnModel, element_matrix::Function)
+    for e in 1:nelements(m)
+        dofs = element_dofs(e)
+        ke = element_matrix(m, e)
+        for c in 1:12, r in 1:12
+            push!(I, dofs[r]); push!(J, dofs[c]); push!(V, ke[r, c])
+        end
+    end
+    return I, J, V
+end
+
+"""
+    sparse_elastic_stiffness(model)
+
+Sparse version of [`elastic_stiffness`](@ref): member + continuous bracing +
+discrete braces.
+"""
+function sparse_elastic_stiffness(m::BeamColumnModel)
+    n = 144 * nelements(m) + 9 * length(m.braces)
+    I, J, V = sizehint!(Int[], n), sizehint!(Int[], n), sizehint!(Float64[], n)
+    element_triplets!(I, J, V, m, elastic_element_stiffness)
+    for b in m.braces
+        i = node_at(m, b.z)
+        s = m.sections[min(i, nelements(m))]
+        eu, ev = lever_arms(s, b.hx, b.hy)
+        k3 = spring_kernel(b.kx, b.ky, b.kϕ, eu, ev)
+        dofs = 6 * (i - 1) .+ (1, 3, 5)                    # u, v, ϕ
+        for c in 1:3, r in 1:3
+            push!(I, dofs[r]); push!(J, dofs[c]); push!(V, k3[r, c])
+        end
+    end
+    return sparse(I, J, V, ndofs(m), ndofs(m))   # shared entries are summed
+end
+
+"""
+    sparse_geometric_stiffness(model)
+
+Sparse version of [`geometric_stiffness`](@ref): Kg = KP + Kq.
+"""
+function sparse_geometric_stiffness(m::BeamColumnModel)
+    n = 144 * nelements(m)
+    I, J, V = sizehint!(Int[], n), sizehint!(Int[], n), sizehint!(Float64[], n)
+    element_triplets!(I, J, V, m, geometric_element_stiffness)
+    return sparse(I, J, V, ndofs(m), ndofs(m))
+end
+
 "Global consistent load vector of the transverse loads."
 function load_vector(m::BeamColumnModel)
     F = zeros(ndofs(m))
@@ -676,8 +729,10 @@ end
 
 Assemble K = Ke + Kg(P, q) and F = F(q) - Kg d0 and solve the linear equilibrium
 system K d = F for the free DOFs. Kg depends on the loads but not on the
-displacements, so no iteration is needed. K is factored by Cholesky when it is
-positive definite (stable) and by LU otherwise; an error is thrown if it is
+displacements, so no iteration is needed. K is assembled in sparse storage
+([`sparse_elastic_stiffness`](@ref), [`sparse_geometric_stiffness`](@ref)), so
+memory and run time grow linearly with the mesh, and is factored by sparse
+Cholesky when it is positive definite (stable) and by sparse LU otherwise; an error is thrown if it is
 singular (loads exactly at a critical level, or a mechanism).
 `residual_norm` is the norm of K d - F equilibrated row-by-row by the stiffness
 diagonal (dimensionless). With `geometric=false` the axial-force and load-position
@@ -689,12 +744,12 @@ positive definite, i.e. the loads exceed a critical (buckling) level and the
 computed equilibrium state is unstable.
 """
 function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, warn::Bool = true)
-    K = elastic_stiffness(m)
+    K = sparse_elastic_stiffness(m)
     d0 = imperfection_vector(m)
     F = load_vector(m)
     if geometric
-        Kg = geometric_stiffness(m)
-        K .+= Kg
+        Kg = sparse_geometric_stiffness(m)
+        K += Kg
         F .-= Kg * d0
     end
 

@@ -57,8 +57,10 @@ elements with six DOFs per node (`u, u', v, v', ϕ, ϕ'`). The discrete equilibr
   represented by their Hermite interpolant `d0` and loading the member through
   `-Kg d0`.
 * **Solution**: `Kg` depends on the loads but not on the displacements, so `K d = F`
-  is a linear system for a given load state, solved directly (Cholesky when `K` is
-  positive definite, LU otherwise). A warning is raised when the tangent stiffness is
+  is a linear system for a given load state. `K` is assembled in sparse storage
+  (`sparse_elastic_stiffness`, `sparse_geometric_stiffness`) and solved directly
+  (sparse Cholesky when `K` is positive definite, sparse LU otherwise), so memory and
+  run time grow linearly with the mesh. A warning is raised when the tangent stiffness is
   indefinite (loads beyond a critical level).
 * **Critical loads** `critical_load_factors(model)`: generalized eigenvalue problem
   `[Ke + Kq] d = λ (-KP) d`, returning load factors on the reference distribution `P`

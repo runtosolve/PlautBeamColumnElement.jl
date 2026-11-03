@@ -582,4 +582,40 @@ end
     @test deflections(sol, L / 2) == (u = lateral_deflection(sol, L / 2), v = vertical_deflection(sol, L / 2), ϕ = twist(sol, L / 2))
 end
 
+@testset "sparse assembly ≡ dense assembly" begin
+    imp = Imperfection(u0 = 2.0, v0 = 1.0, ϕ0 = 0.01)
+    models = [
+        model2(P = 1000e3, qx = 0.5, imperfection = imp),
+        model2(P = 500e3, qy = 1.0, restraint = Restraint(kx = 0.1, kϕ = 1000.0), bc_right = :fixed),
+        model2(P = (1500e3, 0.0), qx = 1.0, imperfection = imp,
+               braces = [Brace(L / 2; kx = 5e3, kϕ = 1e6, hy = 225.0), Brace(0.2L; ky = 1e4)]),
+        model2(P = 1000e3, qx = 0.5, supports = [Support(L / 2)], imperfection = imp),
+        model1(P = 10e3, imperfection = imp, braces = [Brace(L / 2; kϕ = 230.7e3)]),
+    ]
+    for m in models
+        @test sparse_elastic_stiffness(m) ≈ elastic_stiffness(m)
+        @test sparse_geometric_stiffness(m) ≈ geometric_stiffness(m)
+        free = setdiff(1:size(load_vector(m), 1), constrained_dofs(m))
+        d0 = imperfection_vector(m)
+        for geometric in (true, false)
+            K = elastic_stiffness(m)
+            F = load_vector(m)
+            if geometric
+                Kg = geometric_stiffness(m)
+                K += Kg
+                F -= Kg * d0
+            end
+            ddense = K[free, free] \ F[free]               # dense reference solve
+            sol = solve_beam_column(m; geometric, warn = false)
+            @test sol.d[free] ≈ ddense rtol = 1e-9
+            @test sol.residual_norm < 1e-8
+            @test sol.stable == isposdef(Symmetric(K[free, free]))
+        end
+    end
+    # a mesh whose dense stiffness would need ~2.5 GB solves in sparse storage
+    big = BeamColumnModel(L = 10L, nel = 3000, section = sec2, material = mat,
+                          P = 100e3, qx = 0.5, imperfection = imp)
+    @test solve_beam_column(big).residual_norm < 1e-8
+end
+
 end
