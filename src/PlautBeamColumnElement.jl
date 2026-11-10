@@ -25,19 +25,28 @@ initial imperfect shape `u0`, `v0`, `ϕ0`. With primes denoting d/dz and
 equilibrium equations are
 
     EIy u'''' + EIxy v'''' + kx (u + eu ϕ)
-        + [P (u + u0)' + P yo (ϕ + ϕ0)']'                                   = qx
+        + [P (u + u0)' + P yo (ϕ + ϕ0)']' - (Mx (ϕ + ϕ0))''                  = qx
     EIx v'''' + EIxy u'''' + ky (v + ev ϕ)
-        + [P (v + v0)' - P xo (ϕ + ϕ0)']'                                   = qy
+        + [P (v + v0)' - P xo (ϕ + ϕ0)']' + (My (ϕ + ϕ0))''                  = qy
     ECw ϕ'''' - GJ ϕ'' + kx eu (u + eu ϕ) + ky ev (v + ev ϕ) + kϕ ϕ
         + [P (Io/A) (ϕ + ϕ0)' + P yo (u + u0)' - P xo (v + v0)']'
-        + (qx ax - qy ay) (ϕ + ϕ0)                                          = qx ay + qy ax
+        + (qx ax - qy ay) (ϕ + ϕ0) - Mx (u + u0)'' + My (v + v0)''          = qx ay + qy ax
 
 For uniform P these are Eqs. (1)-(3) of the 2020 paper (right-hand sides moved to
 the left), with the spring terms of its Eqs. (4)-(6) written for continuous bracing
-and the load terms of JCSR Eqs. (2)-(4). P is compression positive and acts along
-the centroids. Elastic stiffness and bracing act on the additional deformation
-only; all second-order (geometric) terms act on the total deformation, so the
-imperfection enters the discrete equations as the load  -Kg d0.
+and the load terms of JCSR Eqs. (2)-(4), extended (v0.4.0) with the classical
+lateral-torsional couplings between the first-order bending moments and the twist,
+the Mx, My terms, as in PlautBeamElement.jl v0.5.0. Mx = E (Ix v'' + Ixy u'') and
+My = E (Iy u'' + Ixy v'') are the first-order moments of the transverse loads (from a
+linear solve with the elastic stiffness alone, so continuous spans, fixed ends and
+bracing reactions are included; y downward, so a sagging Mx is negative). They come
+from the second-order strain energy  U₂ = ∫ (-Mx ϕ u'' + My ϕ v'') dz : twist turns
+part of Mx into a weak-axis moment, and lateral curvature turns part of Mx into a
+torque. The coupling is on by default; `BeamColumnModel(...; moment_coupling =
+false)` recovers the previous equations exactly. P is compression positive and acts
+along the centroids. Elastic stiffness and bracing act on the additional
+deformation only; all second-order (geometric) terms act on the total deformation,
+so the imperfection enters the discrete equations as the load  -Kg d0.
 
 The three fields are interpolated with cubic Hermite polynomials on two-node
 elements; each node carries six degrees of freedom (u, u', v, v', ϕ, ϕ'). The
@@ -46,10 +55,12 @@ discrete equilibrium is
     [Ke + Kg(P, q)] d = F(q) - Kg(P, q) d0
 
 with Ke the elastic + bracing stiffness and Kg the geometric stiffness from the
-axial force (∫ P N'ᵀN' kernels) and from the load position ((qx ax - qy ay) ϕ).
-Kg depends on the loads (P, q) but not on the displacements d, so for a given load
-state this is a linear system and is solved directly; the response is nonlinear in
-the load magnitude only because Kg scales with the load.
+axial force (∫ P N'ᵀN' kernels), from the load position ((qx ax - qy ay) ϕ) and from
+the moment coupling (the symmetric blocks Kg[uϕ] = -∫ Mx N''ᵀN dz,
+Kg[vϕ] = ∫ My N''ᵀN dz and their transposes). Kg depends on the loads (P, q) but not
+on the displacements d, so for a given load state this is a linear system and is
+solved directly; the response is nonlinear in the load magnitude only because Kg
+scales with the load.
 Discrete braces are added as point springs at nodes. Property and load variation
 along the length is allowed: section, material and continuous restraint per
 element; P, qx, qy at nodes (linear inside each element).
@@ -66,11 +77,12 @@ using SparseArrays
 export Section, Material, Restraint, Brace, Support, Imperfection
 export BeamColumnModel, BeamColumnSolution
 export nodes, elastic_stiffness, geometric_stiffness, axial_geometric_stiffness,
-       load_geometric_stiffness, sparse_elastic_stiffness, sparse_geometric_stiffness,
-       load_vector, imperfection_vector, constrained_dofs
+       load_geometric_stiffness, moment_coupling_stiffness, sparse_elastic_stiffness,
+       sparse_geometric_stiffness, load_vector, imperfection_vector, constrained_dofs
 export solve_beam_column, deflections, twist, lateral_deflection, vertical_deflection,
        initial_deflections, total_deflections
-export element_end_forces, brace_forces, critical_load_factors
+export element_end_forces, brace_forces, critical_load_factors, critical_transverse_load_factor,
+       prebuckling_moments, PrebucklingMoments
 export Inputs, Outputs, Model
 
 # ------------------------------------------------------------------
@@ -235,6 +247,10 @@ Keyword arguments:
     gravity is `qy > 0`), applied at (`ax`, `ay`) of the section.
   * `P` — axial force, compression positive, acting along the centroids.
   * `imperfection::Imperfection`.
+  * `moment_coupling` (default `true`) — include the lateral-torsional coupling
+    between the first-order moments of the transverse loads and the twist in the
+    geometric stiffness (module documentation). With `false` the geometric
+    stiffness has the axial-force and load-height terms only.
 
 `qx`, `qy` and `P` may each be a scalar (uniform), a 2-tuple of the values at the
 two ends (linear variation), a vector of nodal values (linear within each element)
@@ -253,6 +269,7 @@ struct BeamColumnModel
     P::Vector{Float64}
     bc_left::Symbol
     bc_right::Symbol
+    moment_coupling::Bool
 end
 
 function BeamColumnModel(; L = nothing, nel = nothing, z = nothing,
@@ -260,7 +277,8 @@ function BeamColumnModel(; L = nothing, nel = nothing, z = nothing,
                          braces = Brace[], supports = Support[],
                          imperfection = Imperfection(),
                          qx = 0.0, qy = 0.0, P = 0.0,
-                         bc_left = :pinned, bc_right = :pinned)
+                         bc_left = :pinned, bc_right = :pinned,
+                         moment_coupling::Bool = true)
     if z === nothing
         (L === nothing || nel === nothing) &&
             throw(ArgumentError("give either node coordinates z or both L and nel"))
@@ -285,7 +303,7 @@ function BeamColumnModel(; L = nothing, nel = nothing, z = nothing,
                             collect(Brace, braces), collect(Support, supports),
                             imperfection,
                             nodal_values(qx, zz), nodal_values(qy, zz), nodal_values(P, zz),
-                            bc_left, bc_right)
+                            bc_left, bc_right, moment_coupling)
     for b in model.braces
         node_at(model, b.z)          # validate brace locations
     end
@@ -358,6 +376,10 @@ function hermite_d(ξ::Float64, Le::Float64)
      (6ξ - 6ξ^2) / Le,
      3ξ^2 - 2ξ)
 end
+
+"d²/dz² of the Hermite shape functions."
+hermite_dd(ξ::Float64, Le::Float64) =
+    ((12ξ - 6) / Le^2, (6ξ - 4) / Le, (6 - 12ξ) / Le^2, (6ξ - 2) / Le)
 
 "∫ N''ᵀ N'' dz — bending/warping stiffness kernel."
 k_bend(Le) = (1 / Le^3) * [ 12.0    6Le   -12.0    6Le
@@ -505,9 +527,87 @@ function load_geometric_element_stiffness(m::BeamColumnModel, e::Int)
     return ke
 end
 
-"Total geometric element stiffness kg = kP + kq."
+"""
+    PrebucklingMoments
+
+First-order moments of the transverse loads on one element, from a linear solve with
+the elastic stiffness alone: end values `Mx1`, `Mx2`, `My1`, `My2` (sign convention of
+[`element_end_forces`](@ref): Mx = E (Ix v'' + Ixy u''), My = E (Iy u'' + Ixy v'')) and
+the end values of the second derivatives `px = My'' = qx - kx (u + eu ϕ)` and
+`py = Mx'' = qy - ky (v + ev ϕ)`, so that the moment inside the element is recovered
+exactly (cubic) by [`moment_at`](@ref).
+"""
+struct PrebucklingMoments
+    Mx1::Float64
+    Mx2::Float64
+    My1::Float64
+    My2::Float64
+    px1::Float64
+    px2::Float64
+    py1::Float64
+    py2::Float64
+end
+
+"""
+    moment_at(M1, M2, p1, p2, Le, ξ)
+
+Moment at ξ ∈ [0, 1] on an element whose end moments are `M1`, `M2` and whose second
+derivative M'' varies linearly from `p1` to `p2`: the linear interpolant plus the
+particular solution that vanishes at both ends.
+"""
+function moment_at(M1, M2, p1, p2, Le, ξ)
+    f1 = ξ^2 / 2 - ξ^3 / 6 - ξ / 3
+    f2 = ξ^3 / 6 - ξ / 6
+    return M1 * (1 - ξ) + M2 * ξ + Le^2 * (p1 * f1 + p2 * f2)
+end
+
+"""
+    moment_coupling_element_stiffness(model, e, moments)
+
+12×12 geometric stiffness of element `e` from the lateral-torsional coupling of the
+first-order moments with the twist: the symmetric u-ϕ and v-ϕ blocks
+-∫ Mx N''ᵀ N dz and ∫ My N''ᵀ N dz (and their transposes), from the second-order
+energy ∫ (-Mx ϕ u'' + My ϕ v'') dz. `moments` is the vector returned by
+[`prebuckling_moments`](@ref) (`nothing` gives a zero matrix). Integrated exactly
+with 4-point Gauss quadrature (cubic moment × degree-4 integrand).
+"""
+function moment_coupling_element_stiffness(m::BeamColumnModel, e::Int, moments)
+    ke = zeros(12, 12)
+    moments === nothing && return ke
+    M = moments[e]
+    Le = elength(m, e)
+    kuϕ = zeros(4, 4)
+    kvϕ = zeros(4, 4)
+    for gp in GAUSS4
+        N = collect(hermite(gp.ξ, Le))
+        B = collect(hermite_dd(gp.ξ, Le))
+        Mx = moment_at(M.Mx1, M.Mx2, M.py1, M.py2, Le, gp.ξ)
+        My = moment_at(M.My1, M.My2, M.px1, M.px2, Le, gp.ξ)
+        w = gp.w * Le
+        kuϕ .-= (Mx * w) .* (B * N')
+        kvϕ .+= (My * w) .* (B * N')
+    end
+    add_block!(ke, UDOF, ΦDOF, 1.0, kuϕ)
+    add_block!(ke, ΦDOF, UDOF, 1.0, permutedims(kuϕ))
+    add_block!(ke, VDOF, ΦDOF, 1.0, kvϕ)
+    add_block!(ke, ΦDOF, VDOF, 1.0, permutedims(kvϕ))
+    return ke
+end
+
+"""
+    geometric_element_stiffness(model, e[, moments])
+
+Total geometric element stiffness kg = kP + kq + kM (axial force, load position and
+moment coupling). `moments` are the pre-buckling moments of
+[`prebuckling_moments`](@ref); without the argument they are computed when
+`model.moment_coupling` is set (convenient, but it repeats a global first-order
+solve for every call; the assembly routines pass them in).
+"""
 geometric_element_stiffness(m::BeamColumnModel, e::Int) =
-    axial_geometric_element_stiffness(m, e) + load_geometric_element_stiffness(m, e)
+    geometric_element_stiffness(m, e, prebuckling_moments(m))
+geometric_element_stiffness(m::BeamColumnModel, e::Int, moments) =
+    axial_geometric_element_stiffness(m, e) + load_geometric_element_stiffness(m, e) +
+    moment_coupling_element_stiffness(m, e, moments)
 
 """
     element_load_vector(model, e)
@@ -572,8 +672,23 @@ axial_geometric_stiffness(m::BeamColumnModel) = assemble(m, axial_geometric_elem
 "Global geometric stiffness from the position of the transverse loads (JCSR Eq. 4)."
 load_geometric_stiffness(m::BeamColumnModel) = assemble(m, load_geometric_element_stiffness)
 
-"Total global geometric stiffness Kg = KP + Kq."
-geometric_stiffness(m::BeamColumnModel) = assemble(m, geometric_element_stiffness)
+"""
+    moment_coupling_stiffness(model; moments = prebuckling_moments(model))
+
+Global geometric stiffness from the lateral-torsional coupling of the first-order
+moments with the twist (zero when `model.moment_coupling` is false).
+"""
+moment_coupling_stiffness(m::BeamColumnModel; moments = prebuckling_moments(m)) =
+    assemble(m, (mm, e) -> moment_coupling_element_stiffness(mm, e, moments))
+
+"""
+    geometric_stiffness(model; moments = prebuckling_moments(model))
+
+Total global geometric stiffness Kg = KP + Kq + KM (axial force, load position,
+moment coupling).
+"""
+geometric_stiffness(m::BeamColumnModel; moments = prebuckling_moments(m)) =
+    assemble(m, (mm, e) -> geometric_element_stiffness(mm, e, moments))
 
 # Sparse assembly: each element couples only its own 12 DOFs and each brace only
 # the (u, v, ϕ) DOFs of one node, so K is banded and sparse storage grows linearly
@@ -615,14 +730,14 @@ function sparse_elastic_stiffness(m::BeamColumnModel)
 end
 
 """
-    sparse_geometric_stiffness(model)
+    sparse_geometric_stiffness(model; moments = prebuckling_moments(model))
 
-Sparse version of [`geometric_stiffness`](@ref): Kg = KP + Kq.
+Sparse version of [`geometric_stiffness`](@ref): Kg = KP + Kq + KM.
 """
-function sparse_geometric_stiffness(m::BeamColumnModel)
+function sparse_geometric_stiffness(m::BeamColumnModel; moments = prebuckling_moments(m))
     n = 144 * nelements(m)
     I, J, V = sizehint!(Int[], n), sizehint!(Int[], n), sizehint!(Float64[], n)
-    element_triplets!(I, J, V, m, geometric_element_stiffness)
+    element_triplets!(I, J, V, m, (mm, e) -> geometric_element_stiffness(mm, e, moments))
     return sparse(I, J, V, ndofs(m), ndofs(m))
 end
 
@@ -722,6 +837,52 @@ struct BeamColumnSolution
     residual_norm::Float64
     geometric::Bool
     stable::Bool
+    moments::Union{Nothing, Vector{PrebucklingMoments}}   # coupling moments used in Kg, if any
+end
+
+"Factor the free-DOF stiffness (sparse Cholesky, sparse LU if indefinite); returns (factorization, stable)."
+function factor_free(Kf)
+    C = cholesky(Symmetric(Kf); check = false)
+    stable = issuccess(C)
+    if !stable
+        C = lu(Kf; check = false)
+        issuccess(C) ||
+            error("stiffness matrix K = Ke + Kg is singular; the loads may be at a " *
+                  "critical level, or the supports do not prevent rigid-body motion")
+    end
+    return C, stable
+end
+
+"""
+    prebuckling_moments(model)
+
+First-order (pre-buckling) bending moments of the transverse loads that drive the
+moment-coupling terms, or `nothing` when `model.moment_coupling` is false. They come
+from one linear solve with the elastic stiffness alone (no axial force, no
+imperfection), so they are exact for statically indeterminate members (interior
+supports, fixed ends) and include the bracing reactions. Returns one
+[`PrebucklingMoments`](@ref) per element. The moments are proportional to the
+transverse loads, so the coupling part of Kg is proportional to q.
+"""
+function prebuckling_moments(m::BeamColumnModel)
+    m.moment_coupling || return nothing
+    (all(iszero, m.qx) && all(iszero, m.qy)) &&
+        return [PrebucklingMoments(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0) for _ in 1:nelements(m)]
+    K = sparse_elastic_stiffness(m)
+    F = load_vector(m)
+    free = free_dofs(m)
+    C, _ = factor_free(K[free, free])
+    d = zeros(ndofs(m))
+    d[free] = C \ F[free]
+    return map(1:nelements(m)) do e
+        de = d[element_dofs(e)]
+        g = elastic_element_stiffness(m, e) * de - element_load_vector(m, e)
+        s = m.sections[e]; r = m.restraints[e]
+        eu, ev = lever_arms(s, r.hx, r.hy)
+        PrebucklingMoments(-g[4], g[10], -g[2], g[8],
+                           m.qx[e] - r.kx * (de[1] + eu * de[5]), m.qx[e + 1] - r.kx * (de[7] + eu * de[11]),
+                           m.qy[e] - r.ky * (de[3] + ev * de[5]), m.qy[e + 1] - r.ky * (de[9] + ev * de[11]))
+    end
 end
 
 """
@@ -747,8 +908,9 @@ function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, warn::Boo
     K = sparse_elastic_stiffness(m)
     d0 = imperfection_vector(m)
     F = load_vector(m)
+    moments = geometric ? prebuckling_moments(m) : nothing
     if geometric
-        Kg = sparse_geometric_stiffness(m)
+        Kg = sparse_geometric_stiffness(m; moments)
         K += Kg
         F .-= Kg * d0
     end
@@ -757,14 +919,7 @@ function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, warn::Boo
     Kf = K[free, free]
     Ff = F[free]
 
-    C = cholesky(Symmetric(Kf); check = false)
-    stable = issuccess(C)
-    if !stable
-        C = lu(Kf; check = false)
-        issuccess(C) ||
-            error("stiffness matrix K = Ke + Kg is singular; the loads may be at a " *
-                  "critical level, or the supports do not prevent rigid-body motion")
-    end
+    C, stable = factor_free(Kf)
     df = C \ Ff
 
     warn && !stable &&
@@ -774,7 +929,7 @@ function solve_beam_column(m::BeamColumnModel; geometric::Bool = true, warn::Boo
     scale = max.(abs.(diag(Kf)), eps())
     d = zeros(ndofs(m))
     d[free] = df
-    return BeamColumnSolution(m, d, d0, norm((Kf * df - Ff) ./ scale), geometric, stable)
+    return BeamColumnSolution(m, d, d0, norm((Kf * df - Ff) ./ scale), geometric, stable, moments)
 end
 
 # ------------------------------------------------------------------
@@ -855,15 +1010,33 @@ tuple `(z, Vx, My, Vy, Mx, T, B)` conjugate to the DOFs (u, u', v, v', ϕ, ϕ'):
 Discrete braces and supports act at nodes, so the actions jump across a braced or
 supported node by the brace force or reaction. Moments are about the centroidal
 x-y axes (not necessarily principal).
+
+With moment coupling (`model.moment_coupling`), `axes` selects the reference axes:
+
+  * `:fixed` (default) — the nodal actions use the full kg, including the coupling
+    blocks, and are in equilibrium about the fixed (undeformed) x, y, z axes; values at
+    coincident element ends agree and statics checks hold exactly. For a member with
+    no lateral load, My about the fixed axes stays ≈ 0 even though the section bends
+    laterally.
+  * `:section` — the coupling blocks are left out, so My ≈ E (Iy u'' + Ixy v'') plus
+    the P-δ terms, and T is the resultant about the twisted section's own axes (e.g. a
+    weak-axis moment My ≈ Mx ϕ from the rotated strong-axis moment). Use these for
+    stress and capacity checks. They are not exactly continuous between elements; the
+    jump vanishes with mesh refinement.
+
+Without coupling (or `geometric=false`) both options give the same values.
 """
-function element_end_forces(sol::BeamColumnSolution)
+function element_end_forces(sol::BeamColumnSolution; axes::Symbol = :fixed)
+    axes in (:fixed, :section) ||
+        throw(ArgumentError("axes must be :fixed or :section, got :$axes"))
     m = sol.model
+    moments = axes === :fixed ? sol.moments : nothing
     pack(f, z) = (z = z, Vx = f[1], My = f[2], Vy = f[3], Mx = f[4], T = f[5], B = f[6])
     return map(1:nelements(m)) do e
         dofs = element_dofs(e)
         de, d0e = sol.d[dofs], sol.d0[dofs]
         g = elastic_element_stiffness(m, e) * de - element_load_vector(m, e)
-        sol.geometric && (g .+= geometric_element_stiffness(m, e) * (de .+ d0e))
+        sol.geometric && (g .+= geometric_element_stiffness(m, e, moments) * (de .+ d0e))
         (element = e, end1 = pack(-g[1:6], m.z[e]), end2 = pack(g[7:12], m.z[e + 1]))
     end
 end
@@ -899,7 +1072,8 @@ member (imperfections ignored) buckle, from the generalized eigenvalue problem
     [Ke + Kq] d = λ (-KP) d
 
 where KP is the axial geometric stiffness of the reference distribution `P` and Kq
-the load-position stiffness of the transverse loads (omitted with
+the geometric stiffness of the transverse loads at their given magnitude (load
+position and, when `model.moment_coupling` is set, moment coupling; omitted with
 `load_stiffness=false`). Returns `(factors, modes)`: the `nmodes` smallest positive
 factors in ascending order and the corresponding mode shapes (full DOF vectors,
 scaled to unit maximum absolute value). For a pinned-pinned doubly symmetric
@@ -909,7 +1083,7 @@ function critical_load_factors(m::BeamColumnModel; nmodes::Int = 1, load_stiffne
     any(!iszero, m.P) || throw(ArgumentError("P is zero everywhere: no reference axial load"))
     free = free_dofs(m)
     A = elastic_stiffness(m)
-    load_stiffness && (A .+= load_geometric_stiffness(m))
+    load_stiffness && (A .+= load_geometric_stiffness(m) .+ moment_coupling_stiffness(m))
     Af = Symmetric(A[free, free])
     Bf = Symmetric(-axial_geometric_stiffness(m)[free, free])
 
@@ -939,6 +1113,31 @@ function critical_load_factors(m::BeamColumnModel; nmodes::Int = 1, load_stiffne
         d
     end
     return (factors = factors, modes = modes)
+end
+
+"""
+    critical_transverse_load_factor(model)
+
+Smallest positive factor λ on the transverse loads `qx`, `qy` at which the member,
+carrying the axial force `P` as given, buckles: `[Ke + KP] d = λ (-Kq) d`, where Kq is
+the geometric stiffness of the transverse loads (load position and moment coupling,
+both proportional to q). With `P = 0` and the moment coupling on this is the elastic
+lateral-torsional buckling load of a beam; Ke + KP must be positive definite on the
+free DOFs (P below its own critical level). Returns `Inf` when no positive factor
+exists (e.g. uplift with the load-height term only).
+"""
+function critical_transverse_load_factor(m::BeamColumnModel)
+    (any(!iszero, m.qx) || any(!iszero, m.qy)) ||
+        throw(ArgumentError("qx and qy are zero everywhere: no reference transverse load"))
+    free = free_dofs(m)
+    A = elastic_stiffness(m) .+ axial_geometric_stiffness(m)
+    Af = Symmetric(A[free, free])
+    Kq = (load_geometric_stiffness(m) .+ moment_coupling_stiffness(m))[free, free]
+    ch = cholesky(Af; check = false)
+    issuccess(ch) || error("Ke + KP is not positive definite: P is at or beyond its critical level")
+    M = Symmetric(ch.L \ (Matrix(-Kq) / ch.U))         # -L⁻¹ Kq L⁻ᵀ
+    μ = maximum(eigvals(M))
+    return μ > 0 ? 1 / μ : Inf
 end
 
 # ------------------------------------------------------------------
@@ -1000,7 +1199,8 @@ end
 
 """
     solve(z, A, Ix, Iy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy, qx, qy, P,
-          end_boundary_conditions, supports; xo=0, yo=0, Ixy=0, imperfection=Imperfection(), warn=false)
+          end_boundary_conditions, supports; xo=0, yo=0, Ixy=0, imperfection=Imperfection(),
+          moment_coupling=true, warn=false)
 
 Drop-in replacement for `ThinWalledBeamColumn.solve`. All property, restraint and load
 arguments are arrays of nodal values at the coordinates `z` (element properties are
@@ -1017,6 +1217,8 @@ the average of the two end values; loads and P vary linearly inside each element
   * `hx`, `hy` locate the springs from the centroid (ThinWalledBeamColumn.jl effectively
     measured them from the shear center; identical when `xo = yo = 0`).
   * `Ixy` — optional product of inertia coupling the two bending equations.
+  * `moment_coupling` — lateral-torsional coupling of the first-order moments with the
+    twist (default `true`); `false` recovers the ThinWalledBeamColumn.jl equations.
 
 Returns a [`Model`](@ref) whose `outputs.u`, `outputs.v`, `outputs.ϕ` are the nodal
 deformations, as in ThinWalledBeamColumn.jl.
@@ -1024,7 +1226,8 @@ deformations, as in ThinWalledBeamColumn.jl.
 function solve(z, A, Ix, Iy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy, qx, qy, P,
                end_boundary_conditions, supports;
                xo = zeros(length(z)), yo = zeros(length(z)), Ixy = zeros(length(z)),
-               imperfection::Imperfection = Imperfection(), warn::Bool = false)
+               imperfection::Imperfection = Imperfection(), moment_coupling::Bool = true,
+               warn::Bool = false)
     zz = Float64.(collect(z))
     n = length(zz)
     arr(x) = (length(x) == n || throw(ArgumentError("expected $n nodal values, got $(length(x))"));
@@ -1063,7 +1266,7 @@ function solve(z, A, Ix, Iy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy, qx, q
     model = BeamColumnModel(z = zz, section = sections, material = materials,
                             restraint = restraints, supports = fe_supports,
                             imperfection = imperfection, qx = qx, qy = qy, P = P,
-                            bc_left = :free, bc_right = :free)
+                            bc_left = :free, bc_right = :free, moment_coupling = moment_coupling)
     sol = solve_beam_column(model; warn = warn)
 
     inputs = Inputs(zz, A, Ix, Iy, Ixy, Io, J, Cw, E, G, ax, ay, kx, ky, kϕ, hx, hy, xo, yo,

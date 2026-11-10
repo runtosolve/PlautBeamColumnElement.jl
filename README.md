@@ -25,18 +25,26 @@ additional twist measured from the initial imperfect shape `u0`, `v0`, `ϕ0`. Wi
 the centroid, the equilibrium equations are
 
 ```
-EIy u'''' + EIxy v'''' + kx (u + eu ϕ) + [P (u + u0)' + P yo (ϕ + ϕ0)']'          = qx
-EIx v'''' + EIxy u'''' + ky (v + ev ϕ) + [P (v + v0)' - P xo (ϕ + ϕ0)']'          = qy
+EIy u'''' + EIxy v'''' + kx (u + eu ϕ) + [P (u + u0)' + P yo (ϕ + ϕ0)']' - (Mx (ϕ + ϕ0))''   = qx
+EIx v'''' + EIxy u'''' + ky (v + ev ϕ) + [P (v + v0)' - P xo (ϕ + ϕ0)']' + (My (ϕ + ϕ0))''   = qy
 ECw ϕ'''' - GJ ϕ'' + kx eu (u + eu ϕ) + ky ev (v + ev ϕ) + kϕ ϕ
     + [P (Io/A) (ϕ + ϕ0)' + P yo (u + u0)' - P xo (v + v0)']'
-    + (qx ax - qy ay) (ϕ + ϕ0)                                                   = qx ay + qy ax
+    + (qx ax - qy ay) (ϕ + ϕ0) - Mx (u + u0)'' + My (v + v0)''                      = qx ay + qy ax
 ```
 
 For uniform P these are Eqs. (1)–(3) of the paper with the right-hand sides moved to
 the left, the spring terms of Eqs. (4)–(6) written for continuous bracing, and the
-load terms of JCSR Eqs. (2)–(4). P is compression positive and acts along the
-centroids. Elastic stiffness and bracing act on the additional deformation; all
-second-order (geometric) terms act on the total deformation.
+load terms of JCSR Eqs. (2)–(4), extended (v0.4.0) with the classical lateral-torsional
+couplings between the first-order bending moments and the twist (the `Mx`, `My`
+terms, the same extension as PlautBeamElement.jl v0.5.0). `Mx = E(Ix v'' + Ixy u'')` and
+`My = E(Iy u'' + Ixy v'')` are the first-order moments of the transverse loads from a
+linear solve with the elastic stiffness alone (y downward, so sagging `Mx` is
+negative): twist turns part of `Mx` into a weak-axis moment, and lateral curvature
+turns part of `Mx` into a torque. The coupling is on by default;
+`BeamColumnModel(...; moment_coupling = false)` recovers the previous equations.
+P is compression positive and acts along the centroids. Elastic stiffness and
+bracing act on the additional deformation; all second-order (geometric) terms act on
+the total deformation.
 
 The three fields are interpolated with cubic Hermite polynomials on two-node
 elements with six DOFs per node (`u, u', v, v', ϕ, ϕ'`). The discrete equilibrium is
@@ -53,6 +61,14 @@ elements with six DOFs per node (`u, u', v, v', ϕ, ϕ'`). The discrete equilibr
   P may vary along the member (linear within each element).
 * **Load-position geometric stiffness** `load_geometric_stiffness(model)`:
   `(qx ax - qy ay) ϕ`, softening for gravity load above the shear center.
+* **Moment-coupling geometric stiffness** `moment_coupling_stiffness(model)`: the
+  symmetric u–ϕ and v–ϕ blocks `-∫ Mx N''ᵀN dz` and `∫ My N''ᵀN dz` (and transposes)
+  from the second-order energy `∫ (-Mx ϕ u'' + My ϕ v'') dz`, with the first-order
+  moments of `prebuckling_moments(model)` (exact for continuous spans, fixed ends and
+  bracing reactions; the moment inside an element is recovered as a cubic from the
+  end moments and M'' = q − k·spring displacement). The moments are proportional to
+  the transverse loads, so `Kg` stays load-proportional and displacement-independent.
+  The Wagner term `½ βx Mx ϕ'²` is not included.
 * **Imperfections**: half-sine amplitudes (paper Eq. 10) or arbitrary functions,
   represented by their Hermite interpolant `d0` and loading the member through
   `-Kg d0`.
@@ -64,7 +80,11 @@ elements with six DOFs per node (`u, u', v, v', ϕ, ϕ'`). The discrete equilibr
   indefinite (loads beyond a critical level).
 * **Critical loads** `critical_load_factors(model)`: generalized eigenvalue problem
   `[Ke + Kq] d = λ (-KP) d`, returning load factors on the reference distribution `P`
-  and mode shapes.
+  and mode shapes (`Kq` includes the load-position and moment-coupling terms of the
+  transverse loads at their given magnitude). `critical_transverse_load_factor(model)`
+  is the companion factor on the transverse loads with `P` held fixed,
+  `[Ke + KP] d = λ (-Kq) d`: with `P = 0` the elastic lateral-torsional buckling load
+  of a beam.
 
 End conditions are `:pinned` (u = v = ϕ = 0, free to warp), `:fixed` (all six DOFs)
 or `:free`. `Support(z; u, v, ϕ, u′, v′, ϕ′)` fixes individual DOFs at any node, so
@@ -128,6 +148,11 @@ forces[1].end1                     # (z, Vx, My, Vy, Mx, T, B) on the +z face at
 
 `Vx`, `Vy` include the transverse component of P (reactions come out directly), `My`
 and `Mx` are second-order bending moments, `T` the total torque and `B` the bimoment.
+With the moment coupling, `element_end_forces(sol)` reports actions about the fixed
+(undeformed) axes in exact nodal equilibrium, and `element_end_forces(sol; axes =
+:section)` the resultants about the twisted section's own axes (e.g. the weak-axis
+moment `My ≈ Mx ϕ` created by the rotated strong-axis moment), which is what stress
+and capacity checks need.
 
 ## Drop-in use in place of ThinWalledBeamColumn.jl
 
@@ -165,7 +190,9 @@ The same equations and sign conventions (`ax`, `ay`, `qx`, `qy`, `P`, `kx`, `ky`
 
 ## Verification
 
-`test/runtests.jl` checks the element against closed-form and paper results:
+`test/runtests.jl` checks the element against closed-form and paper results (the
+paper-reference checks run with `moment_coupling = false`, since they test the
+published equations; the "moment coupling" testsets turn it on):
 
 * exact secant-formula beam-column response (deflection, second-order moment,
   reactions) and Euler, torsional, flexural-torsional (C stud, xo ≠ 0), fixed-fixed,
@@ -184,4 +211,11 @@ The same equations and sign conventions (`ax`, `ay`, `qx`, `qy`, `P`, `kx`, `ky`
   rotational spring, linearly varying P against a sine-basis Galerkin reference;
 * element end force continuity, brace-force and support-reaction jumps, bimoment
   boundary conditions; two-span/pinned-fixed equivalence; non-uniform meshes;
-  per-element properties; mesh convergence; input validation.
+  per-element properties; mesh convergence; input validation;
+* moment coupling: symmetry and load-proportionality of `Kg`, exact pre-buckling
+  moments (simple span, `qL²/8` hogging moment of a two-span beam), the classical
+  `C1 ≈ 1.13` lateral-torsional buckling load of a doubly symmetric I-beam under
+  uniform load, an independent sine-series Galerkin solution of the coupled equations
+  (C- and Z-sections, braced and unbraced, from the PlautBeamElement.jl tests),
+  invariance of the in-plane beam-column response (secant formula) for a doubly
+  symmetric section, and the `:fixed`/`:section` end-force options.

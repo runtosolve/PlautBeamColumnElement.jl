@@ -69,8 +69,13 @@ function series_solution(z; s, r = Restraint(), qx = 0.0, qy = 0.0, P = 0.0,
     return (u = u, v = v, ϕ = ϕ)
 end
 
-model1(; nel = 40, kwargs...) = BeamColumnModel(; L, nel, section = sec1, material = mat, kwargs...)
-model2(; nel = 40, kwargs...) = BeamColumnModel(; L, nel, section = sec2, material = mat, kwargs...)
+# The paper-reference testsets check the published equations (axial-force and
+# load-height geometric terms only), so these helpers turn the moment coupling off;
+# the "moment coupling" testsets at the end turn it on.
+model1(; nel = 40, moment_coupling = false, kwargs...) =
+    BeamColumnModel(; L, nel, section = sec1, material = mat, moment_coupling, kwargs...)
+model2(; nel = 40, moment_coupling = false, kwargs...) =
+    BeamColumnModel(; L, nel, section = sec2, material = mat, moment_coupling, kwargs...)
 
 function peak_total_twist(sol; npts = 2439)
     zs = range(0, L, npts)
@@ -230,7 +235,8 @@ end
     ]
     for (s, r, qx, qy, P, a) in cases
         m = BeamColumnModel(L = L, nel = 40, section = s, material = mat, restraint = r,
-                            qx = qx, qy = qy, P = P, imperfection = Imperfection(u0 = a[1], v0 = a[2], ϕ0 = a[3]))
+                            qx = qx, qy = qy, P = P, imperfection = Imperfection(u0 = a[1], v0 = a[2], ϕ0 = a[3]),
+                            moment_coupling = false)
         sol = solve_beam_column(m)
         for z in (0.25L, 0.42L, 0.5L)
             ref = series_solution(z; s, r, qx, qy, P, a)
@@ -246,7 +252,7 @@ end
     for (qx, qy, P) in ((0.0, 0.05, 5e3), (0.02, -0.05, 8e3), (0.0, 0.08, 0.0))
         r = Restraint(kx = 0.01, kϕ = 0.05, hy = -46.05)
         m = BeamColumnModel(L = L, nel = 40, section = s, material = mat, restraint = r,
-                            qx = qx, qy = qy, P = P, imperfection = imp)
+                            qx = qx, qy = qy, P = P, imperfection = imp, moment_coupling = false)
         sol = solve_beam_column(m)
         for z in (0.25L, 0.5L)
             ref = series_solution(z; s, r, qx, qy, P, a = (a1, a2, a3))
@@ -358,21 +364,34 @@ end
     s = Section(A = 1.0, Ix = 4.287e6, Iy = 290500.0, J = 424.56, Cw = 3.1956e9, Io = 1.0,
                 ax = 57.67, ay = 114.3)
     r = Restraint(kx = 0.1, kϕ = 1000.0, hy = -114.3)
-    m = BeamColumnModel(L = 7620.0, nel = 40, section = s, material = mat, restraint = r, qy = 1.0)
+    m = BeamColumnModel(L = 7620.0, nel = 40, section = s, material = mat, restraint = r, qy = 1.0,
+                        moment_coupling = false)
     sol = solve_beam_column(m)
     # values from the JCSR paper, Fig. 7 / PlautBeamFiniteElement: ϕ(L/2) ≈ 0.072, u(L/2) ≈ -8.5 mm
     @test 0.06 < twist(sol, 3810.0) < 0.09
     @test -10.0 < lateral_deflection(sol, 3810.0) < -7.0
+    # with the moment coupling the same model gives ϕ(L/2) ≈ 0.058 rad, u(L/2) ≈ -6.1 mm
+    # (PlautBeamElement.jl v0.5.0 README)
+    solc = solve_beam_column(BeamColumnModel(L = 7620.0, nel = 40, section = s, material = mat, restraint = r, qy = 1.0))
+    @test twist(solc, 3810.0) ≈ 0.058 rtol = 0.03
+    @test lateral_deflection(solc, 3810.0) ≈ -6.1 rtol = 0.03
     # pinned in u, v but free to twist at both ends, uniform torque against a
     # continuous rotational spring: rigid-body twist ϕ = qy ax / kϕ
     s2 = Section(A = sec2.A, Ix = sec2.Ix, Iy = sec2.Iy, J = sec2.J, Cw = sec2.Cw, Io = sec2.Io, ax = 50.0)
     m = BeamColumnModel(L = L, nel = 20, section = s2, material = mat, restraint = Restraint(kϕ = 2000.0),
                         qy = 1.0, bc_left = :free, bc_right = :free,
-                        supports = [Support(0.0; ϕ = false), Support(L; ϕ = false)])
+                        supports = [Support(0.0; ϕ = false), Support(L; ϕ = false)], moment_coupling = false)
     sol = solve_beam_column(m)
     for z in (0.0, 0.3L, L)
         @test twist(sol, z) ≈ 1.0 * 50.0 / 2000.0 rtol = 1e-9
     end
+    # with the coupling the rigid-body twist bends the beam laterally (-(Mx ϕ)'' = -ϕ qy) and
+    # the twist changes slightly
+    solc = solve_beam_column(BeamColumnModel(L = L, nel = 20, section = s2, material = mat, restraint = Restraint(kϕ = 2000.0),
+                                             qy = 1.0, bc_left = :free, bc_right = :free,
+                                             supports = [Support(0.0; ϕ = false), Support(L; ϕ = false)]))
+    @test twist(solc, 0.3L) ≈ 0.025 rtol = 1e-3
+    @test abs(lateral_deflection(solc, 0.5L)) > 0
 end
 
 @testset "varying axial force" begin
@@ -460,14 +479,16 @@ end
 @testset "supports, end conditions and non-uniform meshes" begin
     # two-span column with an interior pinned support ≡ pinned-fixed single span (symmetry)
     r = Restraint(kx = 0.05, kϕ = 100.0, hy = 225.0)
-    two = BeamColumnModel(L = 2L, nel = 80, section = sec2, material = mat, restraint = r,
-                          P = 1000e3, qx = 0.5, supports = [Support(L)])
-    sol2 = solve_beam_column(two)
-    solpf = solve_beam_column(model2(P = 1000e3, qx = 0.5, restraint = r, bc_right = :fixed))
-    for z in (0.2L, 0.5L, 0.8L)
-        @test lateral_deflection(sol2, z) ≈ lateral_deflection(solpf, z) rtol = 1e-8
-        @test twist(sol2, z) ≈ twist(solpf, z) rtol = 1e-8 atol = 1e-12
-        @test lateral_deflection(sol2, z) ≈ lateral_deflection(sol2, 2L - z) rtol = 1e-8
+    for coupling in (false, true)
+        two = BeamColumnModel(L = 2L, nel = 80, section = sec2, material = mat, restraint = r,
+                              P = 1000e3, qx = 0.5, supports = [Support(L)], moment_coupling = coupling)
+        sol2 = solve_beam_column(two)
+        solpf = solve_beam_column(model2(P = 1000e3, qx = 0.5, restraint = r, bc_right = :fixed, moment_coupling = coupling))
+        for z in (0.2L, 0.5L, 0.8L)
+            @test lateral_deflection(sol2, z) ≈ lateral_deflection(solpf, z) rtol = 1e-8
+            @test twist(sol2, z) ≈ twist(solpf, z) rtol = 1e-8 atol = 1e-12
+            @test lateral_deflection(sol2, z) ≈ lateral_deflection(sol2, 2L - z) rtol = 1e-8
+        end
     end
     # end support via Support(...) with :free end conditions ≡ :pinned
     ma = model2(P = 1000e3, qx = 0.5, imperfection = imp, restraint = r)
@@ -488,12 +509,12 @@ end
     @test twist(solve_beam_column(mn), L / 2) ≈ twist(solve_beam_column(mu), L / 2) rtol = 1e-4
     # per-element property vectors: a stepped member with the same section everywhere
     ms = BeamColumnModel(L = L, nel = 40, section = fill(sec2, 40), material = fill(mat, 40),
-                         restraint = fill(r, 40), P = 1000e3, qx = 0.5)
+                         restraint = fill(r, 40), P = 1000e3, qx = 0.5, moment_coupling = false)
     @test solve_beam_column(ms).d ≈ solve_beam_column(model2(P = 1000e3, qx = 0.5, restraint = r)).d
     # a stiffer half stiffens the response
     stiff = Section(A = sec2.A, Ix = sec2.Ix, Iy = 4sec2.Iy, J = sec2.J, Cw = sec2.Cw, Io = sec2.Io)
     mh = BeamColumnModel(L = L, nel = 40, section = vcat(fill(stiff, 20), fill(sec2, 20)),
-                         material = mat, P = 1000e3, qx = 0.5)
+                         material = mat, P = 1000e3, qx = 0.5, moment_coupling = false)
     @test 0 < lateral_deflection(solve_beam_column(mh), L / 2) <
           lateral_deflection(solve_beam_column(model2(P = 1000e3, qx = 0.5)), L / 2)
 end
@@ -616,6 +637,207 @@ end
     big = BeamColumnModel(L = 10L, nel = 3000, section = sec2, material = mat,
                           P = 100e3, qx = 0.5, imperfection = imp)
     @test solve_beam_column(big).residual_norm < 1e-8
+end
+
+# ==================================================================
+# Moment coupling: twist ↔ bending terms -(Mx ϕ)'', (My ϕ)'', -Mx u'', My v''
+# (PlautBeamElement.jl v0.5.0 extension, here together with the axial force)
+# ==================================================================
+
+# beam sections of the JCSR paper used in the PlautBeamElement.jl tests (N, mm);
+# A and Io are needed by the constructor only (P = 0 in the beam checks)
+Lb = 7620.0
+secC = Section(A = 1.0, Io = 1.0, Ix = 4.287e6, Iy = 290500.0, Ixy = 0.0,
+                     J = 424.56, Cw = 3.1956e9, ax = 57.67, ay = 114.3)          # 9CS2.5×059
+secZ = Section(A = 1.0, Io = 1.0, Ix = 3.230e6, Iy = 449530.0, Ixy = -865760.0,
+                     J = 397.09, Cw = 3.4104e9, ax = 27.826, ay = 101.6)         # 8ZS2.25×059
+beam(sec; nel = 40, kwargs...) = BeamColumnModel(; L = Lb, nel, section = sec, material = mat, kwargs...)
+# the JCSR lateral spring on the top flange: kx (u + ay ϕ), i.e. hy = -ay with the shear center at the centroid
+jcsr(kx, kϕ, sec) = Restraint(kx = kx, kϕ = kϕ, hy = -sec.ay)
+
+@testset "moment coupling: geometric stiffness properties" begin
+    @test beam(secZ; qy = 1.0).moment_coupling
+    @test !model2(qy = 1.0).moment_coupling
+    for m in (beam(secZ; qy = 1.0), beam(secC; qy = 1.0, restraint = jcsr(0.1, 1000.0, secC)),
+              BeamColumnModel(L = 2Lb, nel = 80, section = secZ, material = mat, qy = 1.0, supports = [Support(Lb)]),
+              model2(P = 500e3, qx = 0.3, qy = 1.0, moment_coupling = true))
+        Kg = geometric_stiffness(m)
+        KM = moment_coupling_stiffness(m)
+        @test Kg ≈ Kg' atol = 1e-12 * maximum(abs, Kg)
+        @test KM ≈ KM' atol = 1e-12 * maximum(abs, KM)
+        @test Kg ≈ axial_geometric_stiffness(m) + load_geometric_stiffness(m) + KM
+        @test maximum(abs, KM[1:6:end, 5:6:end]) > 0                      # u-ϕ coupling present
+        @test sparse_geometric_stiffness(m) ≈ Kg
+    end
+    # the coupling part is proportional to the transverse load and independent of P
+    m1 = beam(secZ; qy = 1.0, restraint = jcsr(0.1, 1000.0, secZ))
+    m2 = beam(secZ; qy = 2.0, restraint = jcsr(0.1, 1000.0, secZ))
+    @test moment_coupling_stiffness(m2) ≈ 2 * moment_coupling_stiffness(m1) rtol = 1e-10
+    @test moment_coupling_stiffness(model2(P = 800e3, qy = 1.0, moment_coupling = true)) ≈
+          moment_coupling_stiffness(model2(P = 0.0, qy = 1.0, moment_coupling = true)) rtol = 1e-10
+    @test iszero(moment_coupling_stiffness(beam(secZ; qy = 0.0)))
+    @test iszero(moment_coupling_stiffness(beam(secZ; qy = 1.0, moment_coupling = false)))
+    @test prebuckling_moments(beam(secZ; qy = 1.0, moment_coupling = false)) === nothing
+end
+
+@testset "moment coupling: pre-buckling moments" begin
+    # single span: Mx = -q z (L - z)/2 (sagging negative), My = 0 without lateral load
+    m = beam(secZ; qy = 1.0)
+    M = prebuckling_moments(m)
+    Le = Lb / 40
+    for e in (1, 10, 20)
+        z1, z2 = (e - 1) * Le, e * Le
+        @test M[e].Mx1 ≈ -z1 * (Lb - z1) / 2 atol = 1e-6 * Lb^2
+        @test M[e].Mx2 ≈ -z2 * (Lb - z2) / 2 atol = 1e-6 * Lb^2
+        @test abs(M[e].My1) < 1e-8 * Lb^2
+        @test M[e].py1 ≈ 1.0 && M[e].px1 ≈ 0.0
+    end
+    # the moment inside the element is the exact parabola
+    @test PBC.moment_at(M[10].Mx1, M[10].Mx2, M[10].py1, M[10].py2, Le, 0.5) ≈ -(9.5Le) * (Lb - 9.5Le) / 2 rtol = 1e-8
+    # two equal spans: hogging moment qL²/8 over the central support (three-moment theorem)
+    two = BeamColumnModel(L = 2Lb, nel = 80, section = secC, material = mat, qy = 1.0, supports = [Support(Lb)])
+    M2 = prebuckling_moments(two)
+    @test M2[40].Mx2 ≈ Lb^2 / 8 rtol = 1e-8
+    @test M2[41].Mx1 ≈ Lb^2 / 8 rtol = 1e-8
+    # first-order moments: unaffected by the axial force and the imperfection
+    Ma = prebuckling_moments(model2(P = 800e3, qy = 1.0, imperfection = imp, moment_coupling = true))
+    Mb = prebuckling_moments(model2(P = 0.0, qy = 1.0, moment_coupling = true))
+    @test all(Ma[e].Mx2 ≈ Mb[e].Mx2 for e in 1:40)
+end
+
+@testset "moment coupling: classical LTB of a doubly symmetric I-beam" begin
+    # uniform load at the shear center, fork supports: q_cr L²/8 = C1 Mcr, C1 ≈ 1.13
+    E, G = 200e3, 200e3 / 2.6
+    Iy, J, Cw = 2.0e6, 1.0e5, 1.0e11
+    Mcr = π / Lb * sqrt(E * Iy * G * J * (1 + π^2 * E * Cw / (G * J * Lb^2)))
+    mk(ay; kwargs...) = BeamColumnModel(L = Lb, nel = 60, material = Material(E = E, G = G), qy = 1.0,
+                                        section = Section(A = 1.0, Io = 1.0, Ix = 50e6, Iy = Iy, J = J, Cw = Cw, ax = 0.0, ay = ay); kwargs...)
+    C1 = critical_transverse_load_factor(mk(0.0)) * Lb^2 / 8 / Mcr
+    @test 1.12 < C1 < 1.14
+    # load above the shear center lowers q_cr, below raises it
+    @test critical_transverse_load_factor(mk(150.0)) < critical_transverse_load_factor(mk(0.0)) <
+          critical_transverse_load_factor(mk(-150.0))
+    # without the coupling there is no buckling for a load at the shear center
+    @test critical_transverse_load_factor(mk(0.0; moment_coupling = false)) == Inf
+    # a compressive axial force lowers the lateral-torsional buckling load
+    Pe = π^2 * E * Iy / Lb^2
+    @test critical_transverse_load_factor(mk(0.0; P = 0.3Pe)) < critical_transverse_load_factor(mk(0.0))
+    # without coupling the critical factor is the load-height closed form of the JCSR beam
+    λ1 = π / Lb
+    qcr = (mat.E * secC.Cw * λ1^4 + mat.G * secC.J * λ1^2) / secC.ay
+    @test critical_transverse_load_factor(beam(secC; qy = 1.0, moment_coupling = false)) ≈ qcr rtol = 1e-5
+end
+
+@testset "moment coupling vs spectral Galerkin reference (P = 0)" begin
+    # Independent sine-series Galerkin solution of the coupled beam equations for a
+    # pinned-pinned beam under uniform gravity load (from the PlautBeamElement.jl tests):
+    # Mx(z) = -q z (L - z)/2 from statics; My(z) = E (Iy u'' + Ixy v'') from the reference's
+    # own first-order solution. Coupling energy ∫ (-Mx ϕ u'' + My ϕ v'') dz.
+    function galerkin(section, restraint, q; N = 60)
+        (; E, G) = mat
+        (; Ix, Iy, Ixy, J, Cw, ax, ay) = section
+        (; kx, kϕ) = restraint
+        nz = 6000
+        zs = range(0, Lb, nz + 1)
+        wz = [(i == 0 || i == nz) ? 1.0 : (isodd(i) ? 4.0 : 2.0) for i in 0:nz] .* (step(zs) / 3)
+        Mx = -q .* zs .* (Lb .- zs) ./ 2
+        S = [sin(mm * π * z / Lb) for z in zs, mm in 1:N]
+        K = zeros(3N, 3N); F = zeros(3N)
+        iu(mm) = 3mm - 2; iv(mm) = 3mm - 1; iϕ(mm) = 3mm
+        for mm in 1:N
+            λ = mm * π / Lb
+            K[iu(mm), iu(mm)] = (E * Iy * λ^4 + kx) * Lb / 2
+            K[iu(mm), iv(mm)] = K[iv(mm), iu(mm)] = E * Ixy * λ^4 * Lb / 2
+            K[iv(mm), iv(mm)] = E * Ix * λ^4 * Lb / 2
+            K[iu(mm), iϕ(mm)] = K[iϕ(mm), iu(mm)] = kx * ay * Lb / 2
+            K[iϕ(mm), iϕ(mm)] = (E * Cw * λ^4 + G * J * λ^2 + kx * ay^2 + kϕ) * Lb / 2
+            c = isodd(mm) ? 2Lb / (mm * π) : 0.0
+            F[iv(mm)] = q * c
+            F[iϕ(mm)] = q * ax * c
+        end
+        x0 = K \ F
+        My = -E .* (S * [(Iy * x0[iu(mm)] + Ixy * x0[iv(mm)]) * (mm * π / Lb)^2 for mm in 1:N])
+        K[diagind(K)[3:3:end]] .-= q * ay * Lb / 2
+        for mm in 1:N, n in 1:N
+            Cx = (mm * π / Lb)^2 * sum(wz .* Mx .* S[:, mm] .* S[:, n])
+            Cy = -(mm * π / Lb)^2 * sum(wz .* My .* S[:, mm] .* S[:, n])
+            K[iu(mm), iϕ(n)] += Cx; K[iϕ(n), iu(mm)] += Cx
+            K[iv(mm), iϕ(n)] += Cy; K[iϕ(n), iv(mm)] += Cy
+        end
+        x = K \ F
+        field(z, off) = sum(x[3mm - off] * sin(mm * π * z / Lb) for mm in 1:N)
+        return (u = z -> field(z, 2), v = z -> field(z, 1), ϕ = z -> field(z, 0))
+    end
+    cases = [(section = secZ, restraint = Restraint(), q = 0.05),                      # unbraced Z
+             (section = secZ, restraint = jcsr(0.1, 1000.0, secZ), q = 1.5),           # braced Z
+             (section = secC, restraint = Restraint(kϕ = 500.0), q = 0.3)]             # C-section
+    for c in cases
+        ref = galerkin(c.section, c.restraint, c.q)
+        sol = solve_beam_column(beam(c.section; nel = 60, restraint = c.restraint, qy = c.q))
+        for z in (0.25Lb, 0.5Lb)
+            @test twist(sol, z) ≈ ref.ϕ(z) rtol = 1e-3
+            @test lateral_deflection(sol, z) ≈ ref.u(z) rtol = 1e-3 atol = 1e-9
+            @test vertical_deflection(sol, z) ≈ ref.v(z) rtol = 1e-3
+        end
+    end
+end
+
+@testset "moment coupling: in-plane beam-column response unchanged, end-force axes" begin
+    # doubly symmetric section loaded in its plane of symmetry: u = ϕ = 0, so the coupling
+    # cannot change the secant-formula response or the P-δ moments
+    EI = mat.E * sec2.Ix
+    Pe = π^2 * EI / L^2
+    for ratio in (0.3, 0.7)
+        P = ratio * Pe; q = 1.0; k = sqrt(P / EI)
+        v_exact = (q / (P * k^2)) * (sec(k * L / 2) - 1) - q * L^2 / (8P)
+        M_exact = (q / k^2) * (sec(k * L / 2) - 1)
+        sol = solve_beam_column(model2(P = P, qy = q, moment_coupling = true))
+        @test vertical_deflection(sol, L / 2) ≈ v_exact rtol = 1e-6
+        @test abs(twist(sol, L / 2)) < 1e-12 && abs(lateral_deflection(sol, L / 2)) < 1e-12
+        for axes in (:fixed, :section)
+            f = element_end_forces(sol; axes)
+            @test f[20].end2.Mx ≈ -M_exact rtol = 1e-6
+            @test f[1].end1.Vy ≈ q * L / 2 rtol = 1e-8
+        end
+    end
+    # coupled beam: :fixed actions are continuous between elements and satisfy statics;
+    # :section gives the weak-axis moment of the twisted section, ≈ Mx ϕ at midspan
+    sol = solve_beam_column(beam(secZ; nel = 60, restraint = jcsr(0.1, 1000.0, secZ), qy = 1.5))
+    ff = element_end_forces(sol)
+    fs = element_end_forces(sol; axes = :section)
+    @test ff[1].end1.Vy ≈ 1.5 * Lb / 2 rtol = 1e-8
+    for e in 1:59, a in (:Vx, :My, :Vy, :Mx, :T, :B)
+        ref = maximum(abs, [getfield(ff[k].end2, a) for k in 1:60])
+        @test isapprox(getfield(ff[e].end2, a), getfield(ff[e + 1].end1, a); rtol = 1e-6, atol = 1e-8 * ref + 1e-12)
+    end
+    ϕm = twist(sol, Lb / 2)
+    @test abs(ϕm) > 1e-3
+    @test_throws ArgumentError element_end_forces(sol; axes = :principal)
+    # unbraced doubly symmetric I-beam with an initial twist, gravity load at the shear
+    # center, P = 0, below its LTB load: the u equation integrates to EIy u'' = Mx (ϕ + ϕ0),
+    # so the weak-axis moment about the twisted section's axes is My_section ≈ Mx ϕ_total,
+    # while about the fixed axes My stays ≈ 0 (no lateral load)
+    E, G = 200e3, 200e3 / 2.6
+    secI = Section(A = 1.0, Io = 1.0, Ix = 50e6, Iy = 2.0e6, J = 1.0e5, Cw = 1.0e11, ax = 0.0, ay = 0.0)
+    mI(q) = BeamColumnModel(L = Lb, nel = 60, section = secI, material = Material(E = E, G = G), qy = q,
+                            imperfection = Imperfection(ϕ0 = 0.01))
+    qcr = critical_transverse_load_factor(mI(1.0))
+    solI = solve_beam_column(mI(0.5qcr))
+    fI = element_end_forces(solI); fIs = element_end_forces(solI; axes = :section)
+    ϕt = twist(solI, Lb / 2; total = true)
+    @test 0.01 < ϕt < 0.01 / (1 - 0.5)       # amplified, but less than a mode-shaped imperfection would be
+    @test fIs[30].end2.My ≈ fIs[30].end2.Mx * ϕt rtol = 0.05
+    @test abs(fI[30].end2.My) < 0.05 * abs(fIs[30].end2.My)
+    @test fI[30].end2.Mx ≈ -0.5qcr * Lb^2 / 8 rtol = 1e-6      # strong-axis moment is the statics value (P = 0)
+    # ThinWalledBeamColumn-style interface passes the switch through
+    z = collect(range(0, Lb, 41)); o = ones(41)
+    args = (z, o, secZ.Ix * o, secZ.Iy * o, o, secZ.J * o, secZ.Cw * o, mat.E * o, mat.G * o,
+            secZ.ax * o, secZ.ay * o, 0.1 * o, 0 * o, 1000.0 * o, 0 * o, -secZ.ay * o, 0 * o, 1.5 * o, 0 * o,
+            ["simply-supported", "simply-supported"], [(0.0, "fixed", "fixed", "fixed"), (Lb, "fixed", "fixed", "fixed")])
+    mon = PBC.solve(args...; Ixy = secZ.Ixy * o)
+    moff = PBC.solve(args...; Ixy = secZ.Ixy * o, moment_coupling = false)
+    @test mon.outputs.ϕ[21] ≈ ϕm rtol = 1e-6
+    @test abs(moff.outputs.ϕ[21] - ϕm) > 0.05 * abs(ϕm)
 end
 
 end
